@@ -134,9 +134,18 @@ static HMONITOR FullscreenMonitor(void)
     MONITORINFO mi;
     WCHAR cls[32];
 
+    /* Shell surfaces that cover the whole monitor but are not fullscreen apps:
+     * the desktop, Alt+Tab / Task View, Start / Search / notification flyouts. */
+    static const WCHAR *const shell[] = {
+        L"Progman", L"WorkerW", L"XamlExplorerHostIslandWindow", L"MultitaskingViewFrame",
+        L"Windows.UI.Core.CoreWindow", L"ForegroundStaging", L"Shell_TrayWnd",
+    };
+    int i;
+
     if (!fg || !GetWindowRect(fg, &r)) return NULL;
-    if (GetClassNameW(fg, cls, 32) && (!lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW")))
-        return NULL;                                /* the desktop itself */
+    if (GetClassNameW(fg, cls, 32))
+        for (i = 0; i < (int)(sizeof shell / sizeof shell[0]); ++i)
+            if (!lstrcmpW(cls, shell[i])) return NULL;
     if (IsZoomed(fg) && (GetWindowLongW(fg, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
         return NULL;
     mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
@@ -720,23 +729,35 @@ static void CardClose(void)
 /* ---- Corner widget: tree + time left. Drag to move, right-click for the menu,
  *      double-click for a break now. Repainted only on state changes and ticks. ---- */
 
-/* Style: cyberpunk on dark glass. A thin neon ring of 20 segments (the minutes
- * left), cyan digits with a soft glow, a magenta unit and a neon edge line.
- * Everything is rendered per pixel into one premultiplied-ARGB buffer so the
- * Win11 acrylic backdrop shows through. Repainted only on ticks and state changes. */
+/* Style: pixel art. A tiny pixel tree, a hand-drawn 3x5 pixel font and a game-style
+ * health bar that drains as the minutes pass. Everything is drawn on a small logical
+ * canvas and blown up by a whole-number factor, so every pixel stays a crisp square.
+ * Repainted only on ticks and state changes. */
 
-static HFONT MakeFontAA(UINT dpi, int px, const WCHAR *face)
+#define PX_W 36                                 /* logical canvas, in "big pixels" */
+#define PX_H 13
+
+/* Size of one big pixel: a whole number of screen pixels, growing with the DPI. */
+static int PixelUnit(UINT dpi)
 {
-    return CreateFontW(-Scale(px, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
+    int u = (int)dpi / 48;
+    return u < 2 ? 2 : u;
 }
 
+/* Window shape: a rectangle with each corner notched off by one big pixel. */
 static void WidgetLayout(UINT dpi)
 {
-    if (g_fWidget) DeleteObject(g_fWidget);
-    if (g_fWidgetUnit) DeleteObject(g_fWidgetUnit);
-    g_fWidget = MakeFontAA(dpi, 13, L"Bahnschrift SemiBold");    /* techy, ships with Windows */
-    g_fWidgetUnit = MakeFontAA(dpi, 8, L"Bahnschrift SemiBold");
+    int u = PixelUnit(dpi), w = PX_W * u, h = PX_H * u, i;
+    const int cx[4] = { 0, w - u, 0, w - u }, cy[4] = { 0, 0, h - u, h - u };
+    HRGN rgn;
+    if (!g_widget) return;
+    rgn = CreateRectRgn(0, 0, w, h);
+    for (i = 0; i < 4; ++i) {
+        HRGN cut = CreateRectRgn(cx[i], cy[i], cx[i] + u, cy[i] + u);
+        CombineRgn(rgn, rgn, cut, RGN_DIFF);
+        DeleteObject(cut);
+    }
+    SetWindowRgn(g_widget, rgn, TRUE);          /* the system owns rgn from here */
 }
 
 static void WidgetUpdate(void)
@@ -787,205 +808,165 @@ static void WidgetSync(void)
     WidgetUpdate();
 }
 
-/* src-over of a premultiplied colour (r, g, b scaled by a/255) onto a pixel */
-static void Over(DWORD *d, DWORD r, DWORD g, DWORD b, DWORD a)
+/* Retro 16-colour palette (0xRRGGBB, also the DIB pixel layout) */
+#define P_BLACK   0x000000
+#define P_NAVY    0x1D2B53
+#define P_NAVY_HI 0x2E4178
+#define P_NAVY_LO 0x111A33
+#define P_SLOT_HI 0x2B3A66
+#define P_SLOT_LO 0x162040
+#define P_PLUM    0x7E2553
+#define P_DGREEN  0x008751
+#define P_BROWN   0xAB5236
+#define P_RUST    0xD8580A
+#define P_DGRAY   0x5F574F
+#define P_LGRAY   0xC2C3C7
+#define P_WHITE   0xFFF1E8
+#define P_RED     0xFF004D
+#define P_ORANGE  0xFFA300
+#define P_YELLOW  0xFFEC27
+#define P_GREEN   0x00E436
+#define P_LIME    0xA8F060
+
+/* 3x5 pixel font (M and N are wider). Each row is a bit pattern, leftmost pixel = high bit. */
+typedef struct { char ch; BYTE w; BYTE row[5]; } Glyph;
+static const Glyph g_font[] = {
+    { '0', 3, { 7, 5, 5, 5, 7 } }, { '1', 3, { 2, 6, 2, 2, 7 } }, { '2', 3, { 7, 1, 7, 4, 7 } },
+    { '3', 3, { 7, 1, 7, 1, 7 } }, { '4', 3, { 5, 5, 7, 1, 1 } }, { '5', 3, { 7, 4, 7, 1, 7 } },
+    { '6', 3, { 7, 4, 7, 5, 7 } }, { '7', 3, { 7, 1, 1, 2, 2 } }, { '8', 3, { 7, 5, 7, 5, 7 } },
+    { '9', 3, { 7, 5, 7, 1, 7 } }, { '<', 3, { 1, 2, 4, 2, 1 } }, { '-', 3, { 0, 0, 7, 0, 0 } },
+    { 'M', 5, { 17, 27, 21, 17, 17 } }, { 'I', 3, { 7, 2, 2, 2, 7 } }, { 'N', 4, { 9, 13, 11, 9, 9 } },
+    { 'R', 3, { 6, 5, 6, 5, 5 } }, { 'E', 3, { 7, 4, 6, 4, 7 } }, { 'S', 3, { 3, 4, 2, 1, 6 } },
+    { 'T', 3, { 7, 2, 2, 2, 2 } }, { 'H', 3, { 5, 5, 7, 5, 5 } }, { 'O', 3, { 2, 5, 5, 5, 2 } },
+    { 'L', 3, { 4, 4, 4, 4, 7 } }, { 'D', 3, { 6, 5, 5, 5, 6 } },
+};
+
+/* Tree sprite: L leaf, H highlight, D shade, T trunk. */
+static const char *const g_tree[9] = {
+    "..LLL..", ".LHLLL.", "LHLLLLL", "LLLLLLD", "LLLLLDD", ".LDDDD.", "...T...", "...T...", "..TTT..",
+};
+
+static DWORD g_cv[PX_H * PX_W];                 /* the logical canvas */
+
+static void Px(int x, int y, DWORD c)
 {
-    DWORD p = *d, k = 255 - a;
-    *d = ((a + ((p >> 24) * k) / 255) << 24) |
-         ((r + ((p >> 16 & 255) * k) / 255) << 16) |
-         ((g + ((p >> 8 & 255) * k) / 255) << 8) |
-         (b + ((p & 255) * k) / 255);
+    if (x >= 0 && x < PX_W && y >= 0 && y < PX_H) g_cv[y * PX_W + x] = c;
 }
 
-/* sin/cos * 1000 for 0, 18, 36 ... 342 degrees (clockwise from 12 o'clock) */
-static const short g_sn[20] = { 0, 309, 588, 809, 951, 1000, 951, 809, 588, 309,
-                                0, -309, -588, -809, -951, -1000, -951, -809, -588, -309 };
-static const short g_cs[20] = { 1000, 951, 809, 588, 309, 0, -309, -588, -809, -951,
-                                -1000, -951, -809, -588, -309, 0, 309, 588, 809, 951 };
-
-/* Neon ring: 20 thin segments, lit = minutes left. Colours are 0xRRGGBB.
- * Lit coverage also goes into the mask's blue channel so it glows. */
-static void DrawRing(DWORD *buf, DWORD *mask, int stride, int x0, int y0, int size, int lit,
-                     DWORD on, DWORD off)
+static const Glyph *FindGlyph(char ch)
 {
-    int R = size * 4;                           /* radius in 1/8-pixel units */
-    int rOut = R * 97 / 100, rIn = R * 70 / 100;
-    int x, y, i, j, k;
+    int i;
+    for (i = 0; i < (int)(sizeof g_font / sizeof g_font[0]); ++i)
+        if (g_font[i].ch == ch) return &g_font[i];
+    return NULL;
+}
 
-    for (y = 0; y < size; ++y) {
-        for (x = 0; x < size; ++x) {
-            DWORD sr = 0, sg = 0, sb = 0, sa = 0, sl = 0;
-            for (j = 0; j < 4; ++j) {
-                for (i = 0; i < 4; ++i) {
-                    int px = 8 * x + 2 * i + 1 - R, py = 8 * y + 2 * j + 1 - R;
-                    int d2 = px * px + py * py, best = 0, par = -2000000000, tan = 0;
-                    DWORD c, a;
-                    if (d2 > rOut * rOut || d2 < rIn * rIn) continue;
-                    for (k = 0; k < 20; ++k) {          /* which segment this sample is in */
-                        int p = px * g_sn[k] - py * g_cs[k];
-                        if (p > par) { par = p; best = k; }
-                    }
-                    tan = px * g_cs[best] + py * g_sn[best];
-                    if ((tan < 0 ? -tan : tan) * 10 > par * 12 / 10) continue;   /* gap between segments */
-                    c = best < lit ? on : off;
-                    a = best < lit ? 255 : 150;
-                    sr += (c >> 16 & 255) * a / 255;
-                    sg += (c >> 8 & 255) * a / 255;
-                    sb += (c & 255) * a / 255;
-                    sa += a;
-                    if (best < lit) sl += 255;
-                }
-            }
-            if (!sa) continue;
-            Over(&buf[(y0 + y) * stride + x0 + x], sr / 16, sg / 16, sb / 16, sa / 16);
-            mask[(y0 + y) * stride + x0 + x] |= sl / 16;
-        }
+static int PxTextWidth(const char *s)
+{
+    int w = 0;
+    for (; *s; ++s) {
+        const Glyph *g = FindGlyph(*s);
+        w += (g ? g->w : 3) + 1;
+    }
+    return w ? w - 1 : 0;
+}
+
+static void PxText(int x, int y, const char *s, DWORD c)
+{
+    int r, k;
+    for (; *s; ++s) {
+        const Glyph *g = FindGlyph(*s);
+        if (g)
+            for (r = 0; r < 5; ++r)
+                for (k = 0; k < g->w; ++k)
+                    if (g->row[r] >> (g->w - 1 - k) & 1) Px(x + k, y + r, c);
+        x += (g ? g->w : 3) + 1;
     }
 }
 
 static void WidgetRender(HDC dc, int w, int h)
 {
-    /* palette (0xRRGGBB) */
-    const DWORD cyan = 0x00E5FF, pink = 0xFF2A6D, segOff = 0x1E3A48, gray = 0x7A8A99;
-    UINT dpi = GetDpiForWindow(g_widget);
-    int pad = Scale(5, dpi), ring = Scale(13, dpi), blur = Scale(2, dpi) > 1 ? Scale(2, dpi) : 1;
-    int line = Scale(1, dpi) > 1 ? Scale(1, dpi) : 1;
-    int lit = 0, tx, x, y, n = w * h;
-    DWORD on = cyan, digit = 0xB8F7FF, glow = cyan, unitCol = pink, edgeL = pink, edgeR = cyan;
-    WCHAR num[16], unit[8];
+    const int barX0 = 11, barX1 = PX_W - 3, barLen = barX1 - barX0 + 1, textY = 2, barY = 9;
+    DWORD leaf = P_GREEN, hi = P_LIME, shade = P_DGREEN, bark = P_BROWN;
+    DWORD numCol = P_WHITE, barHi = P_GREEN, barLo = P_DGREEN;
+    char num[8], unit[4];
+    int fill = 0, x, y, nw;
     BITMAPINFO bi;
-    DWORD *buf, *mask;
-    int *tmp, *acc;
-    HBITMAP bBuf, bMask;
-    HDC mem;
-    HGDIOBJ old;
-    SIZE sz;
-    TEXTMETRICW tmBig, tmSmall;
 
     unit[0] = 0;
     switch (g_state) {
     case ST_ACTIVE: {
         ULONGLONG used = g_activeMs + (GetTickCount64() - g_lastTick);
         ULONGLONG left = used < g_cfg.workMs ? g_cfg.workMs - used : 0;
-        lit = (int)((left * 20 + g_cfg.workMs - 1) / g_cfg.workMs);
-        if (left <= 3 * 60000) {                                    /* almost time: hot pink */
-            on = glow = pink; digit = 0xFFB3C8; unitCol = cyan;
+        fill = (int)((left * barLen + g_cfg.workMs - 1) / g_cfg.workMs);
+        if (left <= 3 * 60000) {                /* low HP: autumn leaves, red bar */
+            leaf = P_ORANGE; hi = P_YELLOW; shade = P_RUST;
+            numCol = P_YELLOW; barHi = P_RED; barLo = P_PLUM;
         }
-        if (left >= 60000) wsprintfW(num, L"%u", (UINT)((left + 59999) / 60000));
-        else lstrcpyW(num, L"<1");
-        lstrcpyW(unit, L"MIN");
+        if (left >= 60000) wsprintfA(num, "%u", (UINT)((left + 59999) / 60000));
+        else lstrcpyA(num, "<1");
+        lstrcpyA(unit, "MIN");
         break;
     }
-    case ST_BREAK:  lit = 20; on = glow = pink; digit = 0xFFB3C8; lstrcpyW(num, L"REST"); break;
-    case ST_PAUSED: on = edgeL = edgeR = gray; digit = 0x9AA5B1; glow = 0; lstrcpyW(num, L"HOLD"); break;
-    default:        edgeL = edgeR = gray; digit = 0x9AA5B1; glow = 0; lstrcpyW(num, L"--"); break;
+    case ST_BREAK:
+        fill = barLen; numCol = P_GREEN;
+        lstrcpyA(num, "REST");
+        break;
+    case ST_PAUSED:
+        leaf = P_LGRAY; hi = P_WHITE; shade = P_DGRAY; bark = P_DGRAY; numCol = P_LGRAY;
+        lstrcpyA(num, "HOLD");
+        break;
+    default:
+        numCol = P_LGRAY;
+        lstrcpyA(num, "--");
+        break;
     }
 
+    /* background with a bevelled frame (the notched corners are cut by the window region) */
+    for (y = 0; y < PX_H; ++y)
+        for (x = 0; x < PX_W; ++x) {
+            DWORD c = P_NAVY;
+            if (y == 0 || y == PX_H - 1 || x == 0 || x == PX_W - 1) c = P_BLACK;
+            else if (y == 1 || x == 1) c = P_NAVY_HI;
+            else if (y == PX_H - 2 || x == PX_W - 2) c = P_NAVY_LO;
+            g_cv[y * PX_W + x] = c;
+        }
+
+    /* tree */
+    for (y = 0; y < 9; ++y)
+        for (x = 0; x < 7; ++x) {
+            char t = g_tree[y][x];
+            if (t != '.') Px(2 + x, 2 + y, t == 'L' ? leaf : t == 'H' ? hi : t == 'D' ? shade : bark);
+        }
+
+    /* time left, with the unit if it fits */
+    PxText(barX0, textY, num, numCol);
+    nw = PxTextWidth(num);
+    if (unit[0] && barX0 + nw + 2 + PxTextWidth(unit) - 1 <= barX1)
+        PxText(barX0 + nw + 2, textY, unit, P_LGRAY);
+
+    /* health bar: two rows for a little depth */
+    for (x = 0; x < barLen; ++x) {
+        BOOL on = x < fill;
+        Px(barX0 + x, barY, on ? barHi : P_SLOT_HI);
+        Px(barX0 + x, barY + 1, on ? barLo : P_SLOT_LO);
+    }
+
+    /* blow it up with hard edges */
     memset(&bi, 0, sizeof bi);
     bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biWidth = PX_W;
+    bi.bmiHeader.biHeight = -PX_H;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
-    bBuf = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&buf, NULL, 0);
-    bMask = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&mask, NULL, 0);
-    tmp = (int *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)n * 2 * sizeof(int));
-    if (!bBuf || !bMask || !tmp) goto done;
-    acc = tmp + n;
-
-    /* 1. deep night-blue tint over the acrylic glass, with faint scanlines */
-    for (y = 0; y < h; ++y) {
-        DWORD a = (y & 1) ? 175 : 150;
-        for (x = 0; x < w; ++x)
-            buf[y * w + x] = (a << 24) | ((8 * a / 255) << 16) | ((10 * a / 255) << 8) | (22 * a / 255);
-    }
-
-    /* 2. text mask: number in the red channel, unit in the green channel */
-    memset(mask, 0, (SIZE_T)n * 4);
-    mem = CreateCompatibleDC(dc);
-    old = SelectObject(mem, bMask);
-    SetBkMode(mem, TRANSPARENT);
-    tx = pad + ring + Scale(5, dpi);
-    SelectObject(mem, g_fWidget);
-    GetTextMetricsW(mem, &tmBig);
-    GetTextExtentPoint32W(mem, num, lstrlenW(num), &sz);
-    SetTextColor(mem, RGB(255, 0, 0));
-    TextOutW(mem, tx, (h - tmBig.tmHeight) / 2, num, lstrlenW(num));
-    if (unit[0]) {
-        SelectObject(mem, g_fWidgetUnit);
-        GetTextMetricsW(mem, &tmSmall);
-        SetTextColor(mem, RGB(0, 255, 0));
-        TextOutW(mem, tx + sz.cx + Scale(2, dpi),
-                 (h - tmBig.tmHeight) / 2 + tmBig.tmAscent - tmSmall.tmAscent, unit, lstrlenW(unit));
-    }
-    GdiFlush();
-    SelectObject(mem, old);
-    DeleteDC(mem);
-
-    /* 3. ring (also marks its lit segments in the mask's blue channel) */
-    DrawRing(buf, mask, w, pad, (h - ring) / 2, ring, lit, on, segOff);
-
-    /* 4. neon glow: box-blur digits + lit ring (horizontal then vertical) */
-    if (glow) {
-        for (y = 0; y < h; ++y)
-            for (x = 0; x < w; ++x) {
-                int s = 0, k;
-                for (k = -blur; k <= blur; ++k)
-                    if (x + k >= 0 && x + k < w) {
-                        DWORD m = mask[y * w + x + k];
-                        DWORD v = (m >> 16 & 255) > (m & 255) ? (m >> 16 & 255) : (m & 255);
-                        s += (int)v;
-                    }
-                tmp[y * w + x] = s;
-            }
-        for (y = 0; y < h; ++y)
-            for (x = 0; x < w; ++x) {
-                int s = 0, k;
-                for (k = -blur; k <= blur; ++k)
-                    if (y + k >= 0 && y + k < h) s += tmp[(y + k) * w + x];
-                acc[y * w + x] = s / ((2 * blur + 1) * (2 * blur + 1));
-            }
-        for (x = 0; x < n; ++x) {
-            DWORD a = (DWORD)acc[x] * 170 / 255;
-            if (a > 255) a = 255;
-            if (a) Over(&buf[x], (glow >> 16 & 255) * a / 255, (glow >> 8 & 255) * a / 255, (glow & 255) * a / 255, a);
-        }
-    }
-
-    /* 5. crisp digits and unit on top */
-    for (x = 0; x < n; ++x) {
-        DWORD a = mask[x] >> 16 & 255, u = mask[x] >> 8 & 255;
-        if (a) Over(&buf[x], (digit >> 16 & 255) * a / 255, (digit >> 8 & 255) * a / 255, (digit & 255) * a / 255, a);
-        if (u) Over(&buf[x], (unitCol >> 16 & 255) * u / 255, (unitCol >> 8 & 255) * u / 255, (unitCol & 255) * u / 255, u);
-    }
-
-    /* 6. neon edge along the bottom: pink fading into cyan */
-    for (y = h - line; y < h; ++y)
-        for (x = 0; x < w; ++x) {
-            DWORD t = (DWORD)x * 255 / (DWORD)(w > 1 ? w - 1 : 1), a = 210;
-            DWORD r = ((edgeL >> 16 & 255) * (255 - t) + (edgeR >> 16 & 255) * t) / 255;
-            DWORD g = ((edgeL >> 8 & 255) * (255 - t) + (edgeR >> 8 & 255) * t) / 255;
-            DWORD b = ((edgeL & 255) * (255 - t) + (edgeR & 255) * t) / 255;
-            Over(&buf[y * w + x], r * a / 255, g * a / 255, b * a / 255, a);
-        }
-
-    /* 7. one blit; DWM uses our alpha because the frame covers the whole client area */
-    mem = CreateCompatibleDC(dc);
-    old = SelectObject(mem, bBuf);
-    BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteDC(mem);
-
-done:
-    if (tmp) HeapFree(GetProcessHeap(), 0, tmp);
-    if (bMask) DeleteObject(bMask);
-    if (bBuf) DeleteObject(bBuf);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, w, h, 0, 0, PX_W, PX_H, g_cv, &bi, DIB_RGB_COLORS, SRCCOPY);
 }
 
 static void WidgetSize(UINT dpi, int *w, int *h)
 {
-    *w = Scale(64, dpi);
-    *h = Scale(22, dpi);
+    *w = PX_W * PixelUnit(dpi);
+    *h = PX_H * PixelUnit(dpi);
 }
 
 /* The one way a drag ends. It clears the flag first and only then lets go of the
@@ -1090,9 +1071,7 @@ static void WidgetCreate(void)
 {
     POINT pt;
     MONITORINFO mi;
-    DWORD corner = DWMWCP_ROUNDSMALL, backdrop = DWMSBT_TRANSIENTWINDOW;   /* acrylic */
-    MARGINS glass = { -1, -1, -1, -1 };
-    BOOL dark;
+    DWORD corner = DWMWCP_DONOTROUND;
     UINT dpi;
     int w, h;
 
@@ -1124,18 +1103,32 @@ static void WidgetCreate(void)
         pt.x = r.left;
         pt.y = r.top;
     }
-    /* Frosted glass: let DWM draw the acrylic backdrop under our alpha pixels. */
-    dark = TRUE;                                /* smoked glass suits the brass + nixie look */
-    DwmExtendFrameIntoClientArea(g_widget, &glass);
-    DwmSetWindowAttribute(g_widget, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof backdrop);
+    /* Pixel art wants hard edges: no DWM rounding; the notched corners come from
+     * the window region set in WidgetLayout. */
     DwmSetWindowAttribute(g_widget, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof corner);
-    DwmSetWindowAttribute(g_widget, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof dark);
     SetWindowPos(g_widget, HWND_TOPMOST, pt.x, pt.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
 static void WidgetDestroy(void)
 {
     if (g_widget) DestroyWindow(g_widget);
+}
+
+/* The foreground window changed: re-check fullscreen right away, so the widget
+ * hides the moment a video goes fullscreen and comes back the moment it leaves,
+ * instead of waiting up to a minute for the next tick. Out-of-context hook: the
+ * call arrives through our own message loop, only on foreground switches. */
+static void CALLBACK OnForeground(HWINEVENTHOOK hook, DWORD ev, HWND h, LONG obj, LONG child, DWORD thread,
+                                  DWORD ms)
+{
+    UNREFERENCED_PARAMETER(hook);
+    UNREFERENCED_PARAMETER(ev);
+    UNREFERENCED_PARAMETER(h);
+    UNREFERENCED_PARAMETER(obj);
+    UNREFERENCED_PARAMETER(child);
+    UNREFERENCED_PARAMETER(thread);
+    UNREFERENCED_PARAMETER(ms);
+    WidgetSync();
 }
 
 /* ---- Hidden main window: receives timers, session, power and tray messages ---- */
@@ -1242,6 +1235,8 @@ void Start(void)
     WTSRegisterSessionNotification(g_hwnd, NOTIFY_FOR_THIS_SESSION);
     TrayAdd();
     if (RegReadDword(L"Widget", 1)) WidgetCreate();
+    SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, OnForeground, 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     StartActive();
     TrimMemory();
 
